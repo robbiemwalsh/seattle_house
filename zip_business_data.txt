@@ -1,0 +1,5 @@
+house prices dataset from kaggle
+
+zip code income data from UMich population research center
+
+https://www.census.gov/data/datasets/2018/econ/cbp/2018-cbp.html
