@@ -1,0 +1,403 @@
+---
+title: "Seattle Area House Prices"
+author: "Robbie Walsh"
+date: "4/5/2021"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r,message=FALSE,warning=FALSE}
+library(MASS)
+library(tidyverse)
+library(readxl)
+library(car)
+```
+
+# Introduction
+
+For my project I will be analyzing a dataset of houses in the Seattle, WA area, specifically King County, which is the most populous county in the Seattle area and contains Seattle, a few northern suburbs, a good amount of its southern suburbs but excludes Tacoma, and all of its eastern suburbs and a lot of more rural area in the east.  House prices are interesting because there are a variety of factors that influence them and there is a lot of variability in house price data which makes it appealing to model using statistical methods.  This particular dataset has about 4000 houses in it, which makes it large enough to dive deep into the data, but not so large that any effect will appear statistically significant.  The dataset contains variables related to the house such as its price (which I will be modeing) as well as the square footage of the house and the lot and the number of bedrooms and bathrooms.  It also has the year the house was built and rennovated (if applicable).  There is information on the number of floors and the square footage above and below the house if there are units above/below the house.  There is also a measure of the condition that the house is in.  There is also information on where the house is located, such as the address, town, zip code, and whether the house has a waterfront view.  Additionally, I will bring in zip code level data from the University of Michigan on the median household income in that zip code.  I will also be pulling in data I found from the census on the number of businesses operating in a particular zip code.  There are many factors that affect house prices over time, modeling house prices over time is a different exercise, since the date of observation in this dataset is over the course of 3 months, any time-varying impacts of house prices are negligible, this is an exercise examening cross-sectional data and trying to find some (relatively) time-invariant factors that help explain house prices.
+
+# Read in data
+
+```{r,message=FALSE,warning=FALSE}
+prices <- read_csv("C:/Users/walshro/Documents/nova/house_prices.csv")
+income <- read_xlsx("C:/Users/walshro/Documents/nova/zipcode_income.xlsx",sheet = "nation")
+business <- read_csv("C:/Users/walshro/Documents/nova/zbp18detail.txt")
+```
+
+First let's clean up the business data.  The data is broken down by the size of the business (in employees) as well as the naics code.  I'm interested in looking at all businesses, and all businesses that fall into professional services, which are naics codes that start with 51-55, as I'm hypothesizing that the presence of those businesses will explain high prices per square foot in city centers.
+
+```{r}
+all_biz <- business %>% group_by(zip) %>% summarize(all_biz = sum(est))
+prof_codes <- c(51,52,53,54,55)
+prof_biz <- business %>% filter(substr(naics,1,2) %in% prof_codes) %>% group_by(zip) %>% summarize(prof_biz = sum(est))
+```
+
+From there we want to merge all of this data together.  We will merge on zip code since each of these datasets contains that, we usually would want to worry about leading 0's but there are no zip codes in Washington state that start with 0 so we can ignore that in this case.
+
+```{r}
+prices <- prices %>% left_join(income,by=c("zip"="Zip"))
+prices <- prices %>% mutate(zip = as.character(zip))
+prices <- prices %>% left_join(all_biz,by=c("zip"="zip"))
+prices <- prices %>% left_join(prof_biz,by=c("zip"="zip"))
+# Some values of prof_biz appear as missing, this is because there are no professional services businesses in those zip codes, replace missing with 0
+prices <- prices %>% mutate(prof_biz = case_when(is.na(prof_biz) ~ 0,
+                                                 TRUE ~ prof_biz))
+any(is.na(prices))
+```
+
+# Examine Price variable
+
+```{r}
+summary(prices$price)
+prices %>% filter(price == 0) %>% count()
+prices %>% filter(price != 0) %>% dplyr::select(price) %>% summary()
+```
+There are 49 observations that have a price of 0, this is obviously incorrect as even the most dilapidated house sells for some amount of money.  After 0 the next highest value is $7,800, which while still low for a house in the Seattle area, at least makes some sense.  I will drop the 0's from the analysis since they likely would cause problems.
+```{r}
+prices <- prices %>% filter(price != 0)
+```
+
+From there we can look at the distribution of the variable.
+```{r}
+ggplot(prices,aes(x=price)) + geom_histogram()
+# Remove outliers, there are two houses over $10 million
+prices <- prices %>% filter(price < 10000000)
+```
+There are two houses that are over $10 million, these are outliers that could cause issues, we will continue to monitor those throughout the analysis.  Other than that, the variable has a severe right skew (as is expected), which will likely support some sort of transformation later on since right-skewed variables like this typically have non-constant variance.
+
+Upon further inspection, the two houses that are prices over \$10 million appear to be a mistake, the first one is in Kent, WA, and a google maps search in combination with a zillow search indicates that the house is worth less than \$1 million by a hefty margin and the price listed is a mistake.  The other house in Seattle is also not worth over \$10 million, zillow says that the house last sold for around \$1 million and the current zestimate is about \$2 million, so while it is a pricey house, the number given is incorrect and these two observations will be dropped.  This also boosted the R squared by 2 percentage points when I removed them.
+
+
+# Create Variables
+
+We'll now create some auxillary variables that could be useful in modeling price.
+
+```{r}
+prices <- prices %>% mutate(age = 2014 - yr_built,since_renno = 2014 - yr_renovated,is_rennovated = as.factor(if_else(yr_renovated == 0,0,1))) %>%
+  mutate(has_basement = if_else(sqft_basement > 0,1,0))
+```
+
+# Looking at assumptions
+
+## Correlation between predictors
+
+```{r}
+# Will check this for quantitative and ordinal predictors
+cor(prices %>% dplyr::select(price,bedrooms,bathrooms,sqft_living,sqft_lot,floors,sqft_above,sqft_basement,yr_built,yr_renovated,Median,Mean,Pop,all_biz,prof_biz,age,since_renno))
+```
+Looking at the correlation matrix, there isn't a ton of multicollinearity given how many variables we have in the dataset.  There seems to be some correlation between variables associated with house size, such as sqft_living, bedrooms and bathrooms, sqft_basement.  There are other obvious correlations like between median and mean household income in a zip code and the total businesses and professional services businesses.  We will keep this in mind as we build our model later.
+
+## Transformations to variables
+
+Econometric theory tells us that we should log just about anything that is denominated in dollars.  This would suggest that we should log price.  This would likely help stabilize the variance since there is more variability in prices as we get to higher prices.  We will build a quick model of price ~ sqft_living (likely the single most important predictor) and use the boxcox function to see what the ideal transformation is.
+
+```{r}
+mod <- lm(price~sqft_living,data=prices)
+boxcox(mod)
+```
+As expected, boxcox is telling us that the ideal $\lambda$ parameter is close to 0, indicating that a log transform of price is appropriate.  This is part of the reason why I wanted to drop the 0 price houses since you cannot take the log of 0.  The log transform should also address the severe right skew we saw earlier.  Let's take a look at the transformed variable we will be modeling.
+
+```{r}
+summary(log(prices$price))
+ggplot(prices,aes(x=log(price))) + geom_histogram()
+```
+This looks like a much nicer variable to model after it has been logged.
+
+# Other data processing
+
+Now I'll transform the necessary variables into factor variables so that they will be treated as categorical in analysis.
+```{r}
+prices <- prices %>% mutate(floors = as.factor(floors),
+                             waterfront = as.factor(waterfront),
+                             view = as.factor(view),
+                             condition = as.factor(condition),
+                             has_basement = as.factor(has_basement),
+                            log_price = log(price))
+```
+
+# Exploratory Covariates Analysis
+
+Now that we have examined the variable we are modeling and gotten out data set up, we can begin to examine potential predictors in our model.
+
+## Quantitative Predictors
+
+```{r,message=FALSE}
+# Square footage is another highly skewed variable, a log transformation appears to create a linear relationship 
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black") + labs(title="Log Price vs Log Square Footage")
+
+# Will try log transform since this is another highly skewed variable
+ggplot(prices,aes(x=log(sqft_lot),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+# Another square footage variable, another log transform
+ggplot(prices,aes(x=log(sqft_above),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+# Square footage of the basement will also be log transformed
+ggplot(prices,aes(x=log(sqft_basement),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+# Median household income is a variable with $ units, so wil log transform it
+ggplot(prices,aes(x=log(Median),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+ggplot(prices,aes(x=Pop,y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+ggplot(prices,aes(x=all_biz,y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+ggplot(prices,aes(x=prof_biz,y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+ggplot(prices,aes(x=bedrooms,y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+ggplot(prices,aes(x=bathrooms,y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+
+ggplot(prices,aes(x=age,y=log_price)) + geom_point(color="blue") + geom_smooth(color="black")
+```
+
+Some of these quantitative predictors look promising, others do not.  Since we know a lot of the square footage variables are correlated, we will likely only want to use one of them, sqft_living is looking like the best bet and makes the most sense intuitively.  After including this variable it will be interesting to see how the relationships change since total price is very different from price per square foot.  I am optimistic about the prof_biz variable and the median household variables, although they did not appear as extraordinarily strong predictors I think after accounting for square footage they will be important.
+
+## Categorical Predictors
+
+```{r,message=FALSE}
+ggplot(prices,aes(floors,y=log_price)) + geom_boxplot()
+
+ggplot(prices,aes(x=waterfront,y=log_price)) + geom_boxplot()
+
+ggplot(prices,aes(x=view,y=log_price)) + geom_boxplot()
+
+ggplot(prices,aes(x=condition,y=log_price)) + geom_boxplot()
+
+ggplot(prices,aes(has_basement,y=log_price)) + geom_boxplot()
+```
+
+Mixed results with the categorical predictors, likely none of these will be home runs but will help at the margins and to target some segments (ex/ waterfront).  
+
+## Potential Interactions, Quantitative/Categorical
+
+Let's look for some potential interactions
+```{r}
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(method = "lm",color="black") + facet_wrap(.~bedrooms) + labs(title="Relationship with Price and Sqft, by bedrooms")
+
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(method = "lm",color="black") + facet_wrap(.~bathrooms) + labs(title="Relationship with Price and Sqft, by bathrooms")
+
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(method = "lm",color="black") + facet_wrap(.~has_basement) + labs(title="Relationship with Price and Sqft, by basement")
+
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(method = "lm",color="black") + facet_wrap(.~waterfront) + labs(title="Relationship with Price and Sqft, by waterfront")
+
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(method = "lm",color="black") + facet_wrap(.~condition) + labs(title="Relationship with Price and Sqft, by condition")
+
+ggplot(prices,aes(x=log(sqft_living),y=log_price)) + geom_point(color="blue") + geom_smooth(method = "lm",color="black") + facet_wrap(.~view) + labs(title="Relationship with Price and Sqft, by view")
+
+ggplot(prices,aes(x=log(Median),y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~waterfront) + labs(title="Relationship with Price and Med Income, by waterfront")
+
+ggplot(prices,aes(x=log(Median),y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~view) + labs(title="Relationship with Price and Med Income, by view")
+
+# Has potential
+ggplot(prices,aes(x=log(Median),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black") + facet_wrap(.~condition) + labs(title="Relationship with Price and Med Income, by condition")
+
+ggplot(prices,aes(x=log(Median),y=log_price)) + geom_point(color="blue") + geom_smooth(color="black") + facet_wrap(.~has_basement) + labs(title="Relationship with Price and Med Income, by waterfront")
+
+# Good interaction to add
+ggplot(prices,aes(x=prof_biz,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~waterfront) + labs(title="Relationship with Price and Prof Biz, by waterfront")
+
+# Could also work
+ggplot(prices,aes(x=prof_biz,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~view) + labs(title="Relationship with Price and Prof Biz, by view")
+
+# Could be one
+ggplot(prices,aes(x=prof_biz,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~condition) + labs(title="Relationship with Price and Prof Biz, by condition")
+
+ggplot(prices,aes(x=prof_biz,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~has_basement) + labs(title="Relationship with Price and Prof Biz, by basement")
+
+# This could be a good one
+ggplot(prices,aes(x=age,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~waterfront) + labs(title="Relationship with Price and age, by waterfront")
+
+ggplot(prices,aes(x=age,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~condition) + labs(title="Relationship with Price and age, by condition")
+
+ggplot(prices,aes(x=age,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~view) + labs(title="Relationship with Price and age, by view")
+
+# Another good one
+ggplot(prices,aes(x=age,y=log_price)) + geom_point(color="blue") + geom_smooth(method="lm",color="black") + facet_wrap(.~has_basement) + labs(title="Relationship with Price and age, by basement")
+```
+
+
+# Modeling
+
+This is the final model that I came up with for predicting the log price.  Most of the variables I was considering made it in in their base form, which makes for fairly easy interpretability.  There did not seem to be a strong case for including interactions based on the graphs (at least quantitative/categorical interactions that have nice interpretations), and many of the interactions did not meaningfully improve model fit and took power away from the base level of their respective variables.  I did some regulaization in the next section to determine which potential interactions DID have meaningful effects, and came up with the two, one was ultimately dropped due to having a high VIF.
+
+```{r}
+prices <- prices %>% mutate(bedroom0 = if_else(bedrooms == 0,1,0),high_prof_biz = if_else(prof_biz > 4500,1,0))
+mod <- lm(log_price ~ log(sqft_living) + prof_biz + bedrooms + bathrooms + waterfront + view + condition + log(Median) + has_basement + floors + age:yr_built,data=prices )
+summary(mod)
+vif(mod)
+```
+
+Some takeaways from the model.  
+
+* Square footage is one of the most important predictors
+* We can explain close to 70% of the variation given the factors considered, pretty good considering the underlying variability in house prices
+* Variables related to "location, location, location" were important, namely prof_biz, median income, with waterfront also having somewhat of an impact
+* The age interaction with yr_built is interesting, from what I've read, older houses and newer houses tend to command higher prices
+* The waterfront and basement variables give a nice "all else equal" interpretation, quantifying an average "waterfront premium" and "basement premium"
+* Marginal effect of bedrooms is negative, once you account for square footage, wasting sqft on bedrooms is a negative for prices
+* Surprisingly low VIFs, we can get strong inferences from this model
+
+Overall R squared is about 68%, running the same model on just Seattle gives an R squared of 69%, while running the model on everything but Seattle gives an R squared of 76%.  Clearly dynamics are different across localities, would like to do some sort of clustering analysis to create suburban/urban groups and create separate models for each.
+
+# Run Elastic Net (Lasso/Ridge)
+
+I am going to use the glinternet package to run a glinernet model estimation.  Glinternet performs L1 regularization (LASSO) which will shrink coefficients, potentially to 0 by setting up an extra term in the loss function.  What glinternet also does it consider all pairwise interactions of the "X" variables passed in, thus allowing for many more possible predictors to be introduced.  Since the LASSO performs variable selection for us, we can worry less about overfitting by considering so many potential predictors.  Another wrinkle that Glinternet introduces is that it performs what is called a group lasso, which introduces a condition that an interaction between $X_i$ and $X_j$ will only be picked if both $X_i$ and $X_j$ have a non-zero coefficient.
+
+```{r}
+# The glinternet function requires that categorical variables be encoded as integers starting with 0
+# We also need to construct a numLevels vector, indicating the number of levels in each column if categorical, and equal to 1 if numeric
+
+library(glinternet)
+
+# Select variables to be used as predictors
+input <- prices %>% dplyr::select(bedrooms,bathrooms,sqft_living,sqft_lot,floors,waterfront,view,condition,sqft_above,sqft_basement,yr_built,yr_renovated,Median,all_biz,prof_biz,age,since_renno,is_rennovated,has_basement)
+# Create vector of target
+y <- prices$log_price
+
+i_num <- sapply(input,is.numeric)
+input[,!i_num] <- apply(input[,!i_num],2,factor) %>% as.data.frame()
+numLevels <- input %>% sapply(nlevels)
+numLevels[numLevels==0] <- 1
+
+input[,!i_num] <- apply(input[,!i_num],2,function(col) as.integer(as.factor(col)) - 1)
+
+glint <- glinternet(X = input,Y = y,numLevels = numLevels,family = 'gaussian')
+plot(glint$lambda,glint$objValue)
+
+# Will choose the 25th lambda, in the middle and there are decreasing returns to less regularization after that
+coefs <- coef(glint)[[25]]
+
+idx_num <- (1:length(i_num))[i_num]
+idx_cat <- (1:length(i_num))[!i_num]
+names(numLevels)[idx_cat[coefs$mainEffects$cat]]
+names(numLevels)[idx_num[coefs$mainEffects$cont]]
+```
+Looking at the 25th highest lambda value gave a good amount of regularization without elimenating all coefficients.  The base level coefficients that came through were bathrooms, sqft_living, Median, prof_biz, yr_built, and age.  Interactions that came through were Median x prof_biz and yr_built x age, which I added to the main model with some success.
+
+With less regularization, many coefficients get added to the model.
+
+# Check assumptions 
+
+```{r}
+plot(mod)
+vif(mod)
+```
+Going over assumptions quickly, linearity should be met, the fitted values vs residuals plot looks promising, and the exploratory plots from earlier seem to indicate that the choice of specification seems appropriate.  Using that same plot, we can see that the variance appears to be constant across the fitted values, at least for the most part which should make inference on our coefficients valid.  Looking at the qq plot, the assumption of normality of the errors seems to be generally held, since this is real life skewed data I think that this assumption is met for the most part, although the tails are a bit fat.  The assumption of independence is not met, there is certainly spatial autocorrelation here, and while I tried to control for location, the fact that I cannot get down below the zip code means that there are certain areas within a zip code that were likely systematically under and over predicted.  Building a model on a more granular geographic location would be ideal.  
+
+# Show model fit, residuals
+
+```{r}
+prices <- prices %>% mutate(pred = predict(mod,.,type="response"),pred_price = exp(pred))
+
+prices %>% mutate(sqft_grp = round(sqft_living/50)*50) %>% group_by(sqft_grp) %>% summarize(actual = mean(price),pred = mean(pred_price)) %>%
+  ggplot() + geom_line(aes(x=sqft_grp,y=actual),color="blue") + geom_line(aes(x=sqft_grp,y=pred),color="red") + labs(title="Actual vs Predicted: Avg Price over Sqft",subtitle = "Actual in Blue, Predicted in Red",x="Sqft, grouped by 50's",y="Price in $")
+
+prices %>% filter(sqft_living < 5000) %>% mutate(sqft_grp = round(sqft_living/50)*50) %>% group_by(sqft_grp) %>% summarize(actual = mean(price),pred = mean(pred_price)) %>%
+  ggplot() + geom_line(aes(x=sqft_grp,y=actual),color="blue") + geom_line(aes(x=sqft_grp,y=pred),color="red") + labs(title="Actual vs Predicted: Avg Price over Sqft",subtitle = "Actual in Blue, Predicted in Red",x="Sqft, grouped by 50's",y="Price in $")
+
+prices %>% mutate(med_grp = round(Median/100)*100) %>% group_by(med_grp) %>% summarize(actual = mean(price),pred = mean(pred_price)) %>%
+  ggplot() + geom_line(aes(x=med_grp,y=actual),color="blue") + geom_line(aes(x=med_grp,y=pred),color="red") + labs(title="Actual vs Predicted: Avg Price over Median Household Income",subtitle = "Actual in Blue, Predicted in Red",x="MHI, grouped by 100's of $",y="Price in $")
+```
+The takeaway is that on average, the model does a good job predicting house prices, there is significant noise and variation that is hard to pick up, and the model has trouble with houses at the "extremes".
+
+Taking a look at the points with the largest absolute residuals, they tend to be houses with high prices, usually above 2 million.
+
+# Improvements, local models
+
+Typically residential real estate values are assessed through "comps" or comparable houses, looking at what houses around it sold for.  This takes it a step further but is a good idea in general, since it localizes the analysis to a particular geography, let's do a few illustrative examples.
+
+```{r}
+# Just Seattle
+mod1 <- lm(log_price ~ log(sqft_living) + prof_biz + bedrooms + bathrooms + waterfront + view + condition + log(Median) + has_basement + floors + age:yr_built,data=prices %>% filter(city=="Seattle"))
+summary(mod1)
+
+# Everything but Seattle
+mod2 <- lm(log_price ~ log(sqft_living) + prof_biz + bedrooms + bathrooms + waterfront + view + condition + log(Median) + has_basement + floors + age:yr_built,data=prices %>% filter(city != "Seattle"))
+summary(mod2)
+
+# Example city/towns
+mod3 <- lm(log_price ~ log(sqft_living) + prof_biz + bedrooms + bathrooms + waterfront + view + condition + log(Median) + has_basement + floors + age:yr_built,data=prices %>% filter(city %in% c("Renton","Kirkland","Issaquah")))
+summary(mod3)
+
+# Get towns that are outside the top 15 in terms of number of houses, try to get smaller towns
+towns <- prices %>% group_by(city) %>% summarize(count=n()) %>% ungroup() %>% arrange(desc(count)) %>% top_n(-29)
+mod4 <- lm(log_price ~ log(sqft_living) + prof_biz + bedrooms + bathrooms + waterfront + view + condition + log(Median) + has_basement + floors + age:yr_built,data=prices %>% filter(city %in% towns$city))
+summary(mod4)
+```
+
+There appear to be local factors that are more/less influential.  The model seems to do better outside of Seattle, there are probably factors more/less important in an urban setting as opposed to a suburban setting, as the model did about as well on the overall outside Seattle dataset as it did on the few large suburbs that I selected.  Interestingly the model did the worst on the "small towns" dataset that I created, indicating that the model "as is" performs best on large suburbs (but not Bellevue or Redmond where house prices are very high).
+
+# Map of house prices
+
+Let's make a map of where the homes are located and what the price is.
+```{r}
+library(maps)
+library(tigris)
+
+# Download zip code tabulation area data from the 2010 census for Washington state
+zcta1 <- zctas(year=2010,state="wa")
+# Filter zip code data to only include zip codes that appear in the dataset
+zips_in_data <- zcta1 %>% filter(ZCTA5CE10 %in% unique(prices$zip))
+
+# Create dataset of median house price by zip code, merge that with the map data, and plot
+prices %>% group_by(zip) %>% 
+  summarize(med_price = median(price)) %>% 
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>% 
+  ggplot(aes(geometry=geometry,fill=med_price)) + geom_sf() +
+  labs(title = "Median House Price by Zip Code",subtitle="For Zip codes in dataset",xlab = "longitude",ylab = "latitude")
+
+# Outliers make it hard to see other 
+prices %>% group_by(zip) %>% 
+  summarize(med_price = median(price)) %>% 
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>%
+  mutate(log_med_price = log(med_price)) %>%
+  ggplot(aes(geometry=geometry,fill=log_med_price)) + geom_sf() +
+  labs(title="Log of Median House Price by Zip Code",subtitle = "Based off Houses in Dataset",xlab = "longitude",ylab = "latitude")
+
+# Create a map of median household income by zip code to see how it correlates
+prices %>% group_by(zip) %>% 
+  summarize(med_income = median(Median)) %>% 
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>% 
+  ggplot(aes(geometry=geometry,fill=med_income)) + geom_sf() +
+  labs(title="Median Household Income by Zip Code",subtitle = "For Zip codes in dataset",xlab = "longitude",ylab = "latitude")
+
+# Create map of just Seattle houses to zoom in
+prices %>% filter(city == "Seattle") %>% group_by(zip) %>%
+  summarize(med_price = median(price)) %>%
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>%
+  ggplot(aes(geometry=geometry,fill=med_price)) + geom_sf() +
+  labs(title="Median House Price by Zip Code",subtitle = "Based off Houses in Dataset in Seattle",xlab = "longitude",ylab = "latitude")
+
+prices %>% group_by(zip) %>%
+  summarize(total_pop = median(Pop)) %>%
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>%
+  ggplot(aes(geometry=geometry,fill=total_pop)) + geom_sf() +
+  labs(title="Total Population In Each Zip Code",subtitle="For Zip Codes in Dataset",xlab="longitude",ylab="latitude")
+
+prices %>% mutate(resid = abs(price - pred_price)) %>% group_by(zip) %>%
+  summarize(avg_residual = mean(resid)) %>%
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>%
+  ggplot(aes(geometry=geometry,fill=avg_residual)) + geom_sf() +
+  labs(title="Mean Absolute Residual For Each Zip Code",subtitle="For Zip Codes in Dataset",xlab="longitude",ylab="latitude")
+
+prices %>% mutate(resid = abs(price - pred_price)) %>% group_by(zip) %>%
+  summarize(avg_residual = mean(resid)) %>% ungroup() %>% mutate(log_avg_residual = log(avg_residual)) %>%
+  left_join(zips_in_data,by=c("zip"="ZCTA5CE10")) %>%
+  ggplot(aes(geometry=geometry,fill=log_avg_residual)) + geom_sf() +
+  labs(title="Log Mean Absolute Residual For Each Zip Code",subtitle="For Zip Codes in Dataset",xlab="longitude",ylab="latitude")
+```
+The eastern suburbs of Seattle appear to be where house prices are higher, this makes sense as cities like Bellevue and Redmond are generally wealthy areas with expensive real estate.  Southern Seattle and the southern suburbs have lower home prices as these are areas of the city with lower incomes and property values.  Northern Seattle and the new northern suburbs we have appear to be somewhere in the middle. 
+
+# Conclusions
+
+Home Prices are difficult to model precisely, particularly for a large geographical area with lots of different types of communicites and houses.  Still, we can build a model that explains a lot of the variation in house prices, and if we had more data (more variables and more observations) we could better account for location specific effects.  
+A type of model like this could be useful for determening the potential value-added of adding on a particular feature to a house, like a basement or improving the view somehow.  Since home prices are very much a dynamic variable this model would need to be often updated or contain a time-series component to account for macroeconomic changes in the region's housing market.
+Extreme houses are harder to model, it would likely make sense to have location-specific models so that houses in Medina, Bellevue or Mercer Island can be properly accounted for and don't mess up inference on more modestly priced houses.  This goes for very large square footage homes as well.
+This type of analysis is unlikely to become the primary method of assessing residential real estate, as the "comps" analysis is very entrenched in the industry and helps account for changing macroeconomic currents without having to build a sophisticated time-series/panel model.  Still, this type of analysis could be useful if there aren't many comps in the near area or if the house has a drastically different character than others around it (ex/ more bedrooms/bathrooms).  
